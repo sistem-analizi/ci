@@ -1,0 +1,241 @@
+name: Build & Deploy to FTP
+
+on:
+  workflow_call:
+    inputs:
+      build_type:
+        description: 'node | php | static'
+        required: true
+        type: string
+      year:
+        description: '4-digit year, e.g. 2026'
+        required: true
+        type: string
+      project_slug:
+        description: 'Project folder name. Defaults to repository name.'
+        required: false
+        type: string
+        default: ''
+      subdir:
+        description: 'Optional sub-path appended after year/slug'
+        required: false
+        type: string
+        default: ''
+      build_command:
+        description: 'Override default build command (node/php only)'
+        required: false
+        type: string
+        default: ''
+      output_dir:
+        description: 'Override local output directory (e.g. dist, out, .output/public)'
+        required: false
+        type: string
+        default: ''
+      node_version:
+        required: false
+        type: string
+        default: '20'
+      php_version:
+        required: false
+        type: string
+        default: '8.2'
+      clean_slate:
+        description: 'Wipe target dir before upload. Requires at least year/slug depth.'
+        required: false
+        type: boolean
+        default: false
+    secrets:
+      FTP_URI:
+        required: true
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # ── 1. Validate inputs & compute relative path ──────────────────────────
+      - name: Validate inputs & compute path
+        id: path
+        env:
+          BUILD_TYPE: ${{ inputs.build_type }}
+          YEAR:       ${{ inputs.year }}
+          SLUG:       ${{ inputs.project_slug }}
+          SUB:        ${{ inputs.subdir }}
+          REPO:       ${{ github.event.repository.name }}
+        run: |
+          python3 <<'EOF'
+          import os, re, sys
+
+          bt = os.environ["BUILD_TYPE"].strip().lower()
+          if bt not in ("node", "php", "static"):
+              print(f"::error::build_type must be node|php|static, got: {bt}")
+              sys.exit(1)
+
+          year = os.environ["YEAR"].strip()
+          if not re.fullmatch(r"\d{4}", year):
+              print(f"::error::year must be exactly 4 digits, got: {year}")
+              sys.exit(1)
+
+          slug = (os.environ["SLUG"].strip() or os.environ["REPO"].strip())
+          if not re.fullmatch(r"[A-Za-z0-9._-]{2,64}", slug):
+              print(f"::error::project_slug invalid (2-64 chars of [A-Za-z0-9._-]): {slug}")
+              sys.exit(1)
+
+          sub = os.environ["SUB"].strip().strip("/")
+          if sub:
+              if not re.fullmatch(r"[A-Za-z0-9._/-]{1,128}", sub):
+                  print(f"::error::subdir invalid: {sub}")
+                  sys.exit(1)
+              for seg in sub.split("/"):
+                  if seg in ("", ".", ".."):
+                      print(f"::error::subdir contains forbidden segment: {sub}")
+                      sys.exit(1)
+
+          rel = f"{year}/{slug}" + (f"/{sub}" if sub else "")
+          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+              f.write(f"rel={rel}\n")
+          print(f"Computed deploy path (relative): {rel}")
+          EOF
+
+      # ── 2. Safety check for clean_slate ─────────────────────────────────────
+      - name: Safety check for clean_slate
+        if: ${{ inputs.clean_slate }}
+        env:
+          REL: ${{ steps.path.outputs.rel }}
+        run: |
+          seg_count=$(echo "$REL" | tr '/' '\n' | grep -c .)
+          if [ "$seg_count" -lt 2 ]; then
+            echo "::error::clean_slate requires at least year/slug depth, got: $REL"
+            exit 1
+          fi
+          if echo "$REL" | grep -Eq '^[0-9]{4}/?$'; then
+            echo "::error::clean_slate forbidden on year-only path: $REL"
+            exit 1
+          fi
+
+      # ── 3a. Node build ──────────────────────────────────────────────────────
+      - name: Setup Node.js
+        if: inputs.build_type == 'node'
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node_version }}
+          cache: 'npm'
+
+      - name: Install & build (node)
+        if: inputs.build_type == 'node'
+        env:
+          CI: 'false'
+          CUSTOM_CMD: ${{ inputs.build_command }}
+        run: |
+          npm install --no-audit --no-fund
+          if [ -n "$CUSTOM_CMD" ]; then
+            bash -c "$CUSTOM_CMD"
+          else
+            npm run build
+          fi
+
+      # ── 3b. PHP build ───────────────────────────────────────────────────────
+      - name: Setup PHP
+        if: inputs.build_type == 'php'
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: ${{ inputs.php_version }}
+
+      - name: Composer install (php)
+        if: inputs.build_type == 'php'
+        env:
+          CUSTOM_CMD: ${{ inputs.build_command }}
+        run: |
+          if [ -f composer.json ]; then
+            composer install --no-dev --optimize-autoloader
+          fi
+          if [ -n "$CUSTOM_CMD" ]; then
+            bash -c "$CUSTOM_CMD"
+          fi
+
+      # ── 3c. Static: nothing to build ────────────────────────────────────────
+
+      # ── 4. Resolve local output directory ───────────────────────────────────
+      - name: Resolve local dir
+        id: localdir
+        env:
+          OVERRIDE:   ${{ inputs.output_dir }}
+          BUILD_TYPE: ${{ inputs.build_type }}
+        run: |
+          if [ -n "$OVERRIDE" ]; then
+            dir="${OVERRIDE%/}/"
+          else
+            case "$BUILD_TYPE" in
+              node)   dir="./build/" ;;
+              php)    dir="./" ;;
+              static) dir="./" ;;
+            esac
+          fi
+          if [ ! -d "$dir" ]; then
+            echo "::error::Output directory not found: $dir"
+            exit 1
+          fi
+          echo "dir=$dir" >> "$GITHUB_OUTPUT"
+          echo "Local dir to upload: $dir"
+
+      # ── 5. Parse FTP_URI & merge with computed path ─────────────────────────
+      - name: Parse FTP URI
+        id: ftp
+        env:
+          FTP_URI: ${{ secrets.FTP_URI }}
+          REL:     ${{ steps.path.outputs.rel }}
+        run: |
+          python3 <<'EOF'
+          import os, urllib.parse, sys
+
+          uri = os.environ["FTP_URI"].strip()
+          if not uri:
+              print("::error::FTP_URI secret is empty"); sys.exit(1)
+
+          p = urllib.parse.urlparse(uri)
+          scheme = (p.scheme or "ftp").lower()
+          if scheme not in ("ftp", "ftps", "sftp"):
+              print(f"::error::unsupported scheme: {scheme}"); sys.exit(1)
+
+          host = p.hostname or ""
+          if not host:
+              print("::error::FTP_URI must include a host"); sys.exit(1)
+
+          port = p.port or (22 if scheme == "sftp" else 21)
+          user = urllib.parse.unquote(p.username or "")
+          pwd  = urllib.parse.unquote(p.password or "")
+
+          base = (p.path or "/").rstrip("/")
+          rel  = os.environ["REL"].strip("/")
+          full = f"{base}/{rel}/" if base else f"/{rel}/"
+
+          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+              f.write(f"server={host}\n")
+              f.write(f"port={port}\n")
+              f.write(f"protocol={scheme}\n")
+              f.write(f"server_dir={full}\n")
+
+          if user: print(f"::add-mask::{user}")
+          if pwd:  print(f"::add-mask::{pwd}")
+
+          with open(os.environ["GITHUB_ENV"], "a") as f:
+              f.write(f"FTP_USER={user}\n")
+              f.write(f"FTP_PASS={pwd}\n")
+
+          print(f"Target: {scheme}://{host}:{port}{full}")
+          EOF
+
+      # ── 6. Deploy ───────────────────────────────────────────────────────────
+      - name: Deploy to FTP
+        uses: SamKirkland/FTP-Deploy-Action@v4.3.5
+        with:
+          server:     ${{ steps.ftp.outputs.server }}
+          port:       ${{ steps.ftp.outputs.port }}
+          protocol:   ${{ steps.ftp.outputs.protocol }}
+          server-dir: ${{ steps.ftp.outputs.server_dir }}
+          username:   ${{ env.FTP_USER }}
+          password:   ${{ env.FTP_PASS }}
+          local-dir:  ${{ steps.localdir.outputs.dir }}
+          dangerous-clean-slate: ${{ inputs.clean_slate }}
