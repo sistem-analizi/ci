@@ -145,10 +145,12 @@ jobs:
         if: inputs.build_type == 'node'
         env:
           CI: 'false'
-          PUBLIC_URL: /${{ steps.path.outputs.rel }}/
-          BASE_URL:   /${{ steps.path.outputs.rel }}/
-          CUSTOM_CMD: ${{ inputs.build_command }}
-          PM:         ${{ steps.pm.outputs.pm }}
+          PUBLIC_URL:        /${{ steps.path.outputs.rel }}/
+          BASE_URL:          /${{ steps.path.outputs.rel }}/
+          NUXT_APP_BASE_URL: /${{ steps.path.outputs.rel }}/
+          VITE_BASE_URL:     /${{ steps.path.outputs.rel }}/
+          CUSTOM_CMD:        ${{ inputs.build_command }}
+          PM:                ${{ steps.pm.outputs.pm }}
         run: |
           echo "Package manager: $PM"
           echo "PUBLIC_URL: $PUBLIC_URL"
