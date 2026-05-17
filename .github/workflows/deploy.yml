@@ -45,12 +45,12 @@ on:
         type: boolean
         default: false
       build_env:
-        description: 'Extra non-secret env vars (KEY=VALUE per line). For literal values only — do NOT use ${{ secrets }} here.'
+        description: 'Extra non-secret env vars (KEY=VALUE per line). Literal values only — do not interpolate secrets here.'
         required: false
         type: string
         default: ''
       forward_secrets:
-        description: 'Comma-separated secret names to forward from caller into build env. Caller must use `secrets: inherit`.'
+        description: 'Comma-separated secret names to forward from caller into build env. Caller must use secrets:inherit.'
         required: false
         type: string
         default: ''
