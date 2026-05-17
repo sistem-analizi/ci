@@ -116,24 +116,65 @@ jobs:
           fi
 
       # ── 3a. Node build ──────────────────────────────────────────────────────
+      - name: Detect package manager
+        if: inputs.build_type == 'node'
+        id: pm
+        run: |
+          if [ -f pnpm-lock.yaml ]; then
+            echo "pm=pnpm" >> "$GITHUB_OUTPUT"
+          elif [ -f yarn.lock ]; then
+            echo "pm=yarn" >> "$GITHUB_OUTPUT"
+          else
+            echo "pm=npm" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Setup pnpm
+        if: inputs.build_type == 'node' && steps.pm.outputs.pm == 'pnpm'
+        uses: pnpm/action-setup@v3
+        with:
+          version: 9
+
       - name: Setup Node.js
         if: inputs.build_type == 'node'
         uses: actions/setup-node@v4
         with:
           node-version: ${{ inputs.node_version }}
-          cache: 'npm'
+          cache: ${{ steps.pm.outputs.pm }}
 
       - name: Install & build (node)
         if: inputs.build_type == 'node'
         env:
           CI: 'false'
+          PUBLIC_URL: /${{ steps.path.outputs.rel }}/
+          BASE_URL:   /${{ steps.path.outputs.rel }}/
           CUSTOM_CMD: ${{ inputs.build_command }}
+          PM:         ${{ steps.pm.outputs.pm }}
         run: |
-          npm install --no-audit --no-fund
+          echo "Package manager: $PM"
+          echo "PUBLIC_URL: $PUBLIC_URL"
+
+          # Install
+          case "$PM" in
+            pnpm) pnpm install --frozen-lockfile ;;
+            yarn) yarn install --frozen-lockfile ;;
+            npm)
+              if [ -f package-lock.json ]; then
+                npm ci
+              else
+                npm install --no-audit --no-fund
+              fi
+              ;;
+          esac
+
+          # Build
           if [ -n "$CUSTOM_CMD" ]; then
             bash -c "$CUSTOM_CMD"
           else
-            npm run build
+            case "$PM" in
+              pnpm) pnpm run build ;;
+              yarn) yarn build ;;
+              npm)  npm run build ;;
+            esac
           fi
 
       # ── 3b. PHP build ───────────────────────────────────────────────────────
