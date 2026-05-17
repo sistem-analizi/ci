@@ -45,7 +45,12 @@ on:
         type: boolean
         default: false
       build_env:
-        description: 'Extra env vars for build (KEY=VALUE per line). Use to map caller secrets.'
+        description: 'Extra non-secret env vars (KEY=VALUE per line). For literal values only — do NOT use ${{ secrets }} here.'
+        required: false
+        type: string
+        default: ''
+      forward_secrets:
+        description: 'Comma-separated secret names to forward from caller into build env. Caller must use `secrets: inherit`.'
         required: false
         type: string
         default: ''
@@ -146,25 +151,45 @@ jobs:
           node-version: ${{ inputs.node_version }}
           cache: ${{ steps.pm.outputs.pm }}
 
-      - name: Apply caller build env
+      - name: Apply caller build env (non-secret)
         if: inputs.build_type == 'node' && inputs.build_env != ''
         env:
           BUILD_ENV: ${{ inputs.build_env }}
         run: |
-          echo "Applying caller-provided env vars (values masked):"
+          echo "Applying caller-provided non-secret env vars:"
           while IFS= read -r line; do
             [ -z "$line" ] && continue
             case "$line" in '#'*) continue ;; esac
             key="${line%%=*}"
-            val="${line#*=}"
-            # Register value with the log scrubber — masks it in all subsequent log output.
-            # The ::add-mask:: workflow command itself is consumed by the runner, not echoed.
-            if [ -n "$val" ]; then
-              printf '::add-mask::%s\n' "$val"
-            fi
-            echo "  -> $key (masked)"
+            echo "  -> $key"
             echo "$line" >> "$GITHUB_ENV"
           done <<< "$BUILD_ENV"
+
+      - name: Forward inherited secrets to build env
+        if: inputs.build_type == 'node' && inputs.forward_secrets != ''
+        env:
+          SECRETS_JSON: ${{ toJSON(secrets) }}
+          NAMES:        ${{ inputs.forward_secrets }}
+        run: |
+          echo "Forwarding secrets to build env (values masked):"
+          IFS=',' read -ra ARR <<< "$NAMES"
+          for raw in "${ARR[@]}"; do
+            name="$(echo "$raw" | xargs)"
+            [ -z "$name" ] && continue
+            val="$(jq -r --arg n "$name" '.[$n] // empty' <<< "$SECRETS_JSON")"
+            if [ -z "$val" ]; then
+              echo "  -> $name (NOT FOUND — caller must define this secret)"
+              continue
+            fi
+            printf '::add-mask::%s\n' "$val"
+            # Multiline-safe write to GITHUB_ENV via heredoc delimiter
+            {
+              printf '%s<<__EOF_FWD__\n' "$name"
+              printf '%s\n' "$val"
+              printf '__EOF_FWD__\n'
+            } >> "$GITHUB_ENV"
+            echo "  -> $name (masked)"
+          done
 
       - name: Install & build (node)
         if: inputs.build_type == 'node'
