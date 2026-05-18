@@ -59,6 +59,11 @@ on:
         required: false
         type: string
         default: ''
+      post_deploy_hook_url:
+        description: 'URL to GET after successful FTP deploy. Hook key passed via ?key=... using DEPLOY_HOOK_KEY env var (set via forward_secrets).'
+        required: false
+        type: string
+        default: ''
     secrets:
       FTP_URI:
         required: true
@@ -187,20 +192,39 @@ jobs:
               continue
             fi
 
-            # Mask: register whole value, plus each non-empty line, plus each
-            # KEY=VALUE's value-part. ::add-mask:: only fully masks single-line
-            # tokens, so we cover multi-line .env-style secrets by line.
-            printf '::add-mask::%s\n' "$val"
+            # Mask: register whole value, then each line individually,
+            # then each KEY=VALUE's value-part — but ONLY if the value looks
+            # like a real secret (length >= 8 AND not a known common token).
+            # Otherwise short values like "file" or "sync" from .env pollute
+            # the global mask list and corrupt log output.
+            should_mask() {
+              local v="$1"
+              [ ${#v} -lt 8 ] && return 1
+              case "$v" in
+                file|stack|null|log|sync|true|false|yes|no|on|off|smtp|tls|ssl|\
+                mysql|sqlite|sqlite3|postgres|mailgun|ses|production|local|\
+                staging|info|debug|warning|error|critical|emergency|notice|\
+                Laravel|laravel|memory|redis|database|cookie|array)
+                  return 1 ;;
+              esac
+              return 0
+            }
+
+            if should_mask "$val"; then
+              printf '::add-mask::%s\n' "$val"
+            fi
             while IFS= read -r line; do
               [ -z "$line" ] && continue
               case "$line" in '#'*) continue ;; esac
-              printf '::add-mask::%s\n' "$line"
+              # Mask whole KEY=VALUE line only if value-part is real secret
               case "$line" in *=*)
                 line_val="${line#*=}"
-                # Strip surrounding quotes if present
                 line_val="${line_val#\"}"; line_val="${line_val%\"}"
                 line_val="${line_val#\'}"; line_val="${line_val%\'}"
-                [ -n "$line_val" ] && printf '::add-mask::%s\n' "$line_val"
+                if should_mask "$line_val"; then
+                  printf '::add-mask::%s\n' "$line"
+                  printf '::add-mask::%s\n' "$line_val"
+                fi
                 ;;
               esac
             done <<< "$val"
@@ -377,12 +401,16 @@ jobs:
           #    matching files on the remote from being deleted by mirror, which
           #    is what you want for runtime-created data (SQLite DBs, logs, etc).
 
+          # NOT: .env intentionally NOT in defaults. If user commits .env to
+          # repo, it gets deployed. Web access to .env is blocked by the FTP
+          # root .htaccess (FilesMatch "^\."). Projects with real secrets in
+          # .env should keep it in .gitignore and use forward_secrets or
+          # generate .env in build_command (Laravel pattern).
           DEFAULTS=(
             ".git" ".github" ".gitignore" ".gitattributes" ".gitkeep"
             "node_modules"
             ".DS_Store" "Thumbs.db"
             ".vscode" ".idea"
-            ".env"
           )
 
           # Parse user excludes — normalize FTP-Deploy-Action style globs
@@ -486,7 +514,10 @@ jobs:
             else
               printf " --delete"
             fi
-            printf " --parallel=2"
+            # Parallel transfers: 5 = good balance. Higher risks shared-hosting
+            # connection limits (typically 8-10 per IP). Helps significantly for
+            # Laravel/CRA builds with thousands of small vendor/node_modules files.
+            printf " --parallel=5"
             # PRESERVE_GLOBS protect runtime files (DBs, logs, etc.) on remote
             # from being deleted by mirror. Defaults like .git are intentionally
             # NOT in this list — we want orphan cleanup to happen.
@@ -501,3 +532,34 @@ jobs:
           } | lftp
 
           echo "Deploy completed successfully."
+
+      - name: Trigger post-deploy hook
+        if: inputs.post_deploy_hook_url != ''
+        env:
+          HOOK_URL: ${{ inputs.post_deploy_hook_url }}
+          # HOOK_KEY is expected to be set via forward_secrets (e.g.
+          # 'DEPLOY_HOOK_KEY' added to caller's GitHub secrets and listed
+          # in forward_secrets). It arrives here as a plain env var.
+        run: |
+          set -euo pipefail
+          if [ -z "${DEPLOY_HOOK_KEY:-}" ]; then
+            echo "::error::post_deploy_hook_url is set but DEPLOY_HOOK_KEY env var missing. Add DEPLOY_HOOK_KEY to forward_secrets in caller workflow."
+            exit 1
+          fi
+          echo "Triggering post-deploy hook..."
+
+          HTTP_CODE=$(curl -sS --max-time 300 \
+            -w "%{http_code}" \
+            -o /tmp/hook-response.txt \
+            "${HOOK_URL}?key=${DEPLOY_HOOK_KEY}" || echo "000")
+
+          echo "─── Hook response ───"
+          cat /tmp/hook-response.txt || true
+          echo ""
+          echo "─── HTTP $HTTP_CODE ───"
+
+          if [ "$HTTP_CODE" != "200" ]; then
+            echo "::error::Deploy hook returned HTTP $HTTP_CODE"
+            exit 1
+          fi
+          echo "Hook completed successfully."
