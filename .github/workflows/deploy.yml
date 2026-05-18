@@ -396,15 +396,75 @@ jobs:
             echo "__EOF_EXC__"
           } >> "$GITHUB_OUTPUT"
 
-      - name: Deploy to FTP
-        uses: SamKirkland/FTP-Deploy-Action@v4.3.5
-        with:
-          server:     ${{ steps.ftp.outputs.server }}
-          port:       ${{ steps.ftp.outputs.port }}
-          protocol:   ${{ steps.ftp.outputs.protocol }}
-          server-dir: ${{ steps.ftp.outputs.server_dir }}
-          username:   ${{ env.FTP_USER }}
-          password:   ${{ env.FTP_PASS }}
-          local-dir:  ${{ steps.localdir.outputs.dir }}
-          dangerous-clean-slate: ${{ inputs.clean_slate }}
-          exclude:    ${{ steps.exclude.outputs.list }}
+      - name: Deploy via lftp
+        env:
+          FTP_HOST:    ${{ steps.ftp.outputs.server }}
+          FTP_PORT:    ${{ steps.ftp.outputs.port }}
+          FTP_PROTO:   ${{ steps.ftp.outputs.protocol }}
+          FTP_DIR:     ${{ steps.ftp.outputs.server_dir }}
+          LOCAL_DIR:   ${{ steps.localdir.outputs.dir }}
+          CLEAN_SLATE: ${{ inputs.clean_slate }}
+          EXCLUDES:    ${{ steps.exclude.outputs.list }}
+        run: |
+          set -euo pipefail
+
+          # SamKirkland/FTP-Deploy-Action uses basic-ftp which defaults to EPSV
+          # for passive transfers. Many shared-hosting FTP servers (cPanel,
+          # Plesk, etc.) advertise EPSV but actually drop the data connection
+          # mid-transfer (ECONNRESET). lftp lets us force the older PASV
+          # command which is universally compatible.
+
+          # Resolve scheme for lftp URL
+          case "$FTP_PROTO" in
+            ftps) URL_SCHEME="ftps" ;;
+            sftp) URL_SCHEME="sftp" ;;
+            *)    URL_SCHEME="ftp" ;;
+          esac
+
+          echo "Deploying via lftp:"
+          echo "  protocol  : $URL_SCHEME"
+          echo "  host:port : $FTP_HOST:$FTP_PORT"
+          echo "  local     : $LOCAL_DIR"
+          echo "  remote    : $FTP_DIR"
+
+          # Build the lftp command stream
+          {
+            # Network reliability tuning
+            echo "set ftp:use-epsv no"
+            echo "set ftp:passive-mode on"
+            echo "set ftp:ssl-allow yes"
+            echo "set ssl:verify-certificate no"
+            echo "set sftp:auto-confirm yes"
+            echo "set net:max-retries 3"
+            echo "set net:reconnect-interval-base 5"
+            echo "set net:reconnect-interval-multiplier 1"
+            echo "set net:timeout 30"
+            echo "set xfer:clobber on"
+            echo "set cmd:fail-exit yes"
+
+            # Connect
+            printf "open -u '%s','%s' -p %s %s://%s\n" \
+              "$FTP_USER" "$FTP_PASS" "$FTP_PORT" "$URL_SCHEME" "$FTP_HOST"
+
+            # Make sure remote dir exists, then enter it
+            printf "mkdir -fp %s\n" "$FTP_DIR"
+
+            # Build mirror command incrementally
+            printf "mirror --reverse --verbose"
+            if [ "$CLEAN_SLATE" = "true" ]; then
+              printf " --delete-first"
+            else
+              printf " --delete"
+            fi
+            printf " --parallel=2"
+            while IFS= read -r pat; do
+              pat="$(echo "$pat" | xargs)"
+              [ -z "$pat" ] && continue
+              printf " --exclude-glob %s" "$pat"
+            done <<< "$EXCLUDES"
+            printf " -- %s %s\n" "$LOCAL_DIR" "$FTP_DIR"
+
+            echo "bye"
+          } | lftp
+
+          echo "Deploy completed successfully."
