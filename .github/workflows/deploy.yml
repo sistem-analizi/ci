@@ -518,13 +518,20 @@ jobs:
             # connection limits (typically 8-10 per IP). Helps significantly for
             # Laravel/CRA builds with thousands of small vendor/node_modules files.
             printf " --parallel=5"
-            # PRESERVE_GLOBS protect runtime files (DBs, logs, etc.) on remote
-            # from being deleted by mirror. Defaults like .git are intentionally
-            # NOT in this list — we want orphan cleanup to happen.
+            # PRESERVE patterns: use --exclude (regex), NOT --exclude-glob.
+            # lftp's --exclude-glob is unreliable for directory paths — mirror
+            # often still descends/deletes matched dirs. Regex with anchors
+            # gives explicit control: "^pat(/.*)?$" matches the entry itself
+            # AND all subpaths under it.
             while IFS= read -r pat; do
               pat="$(echo "$pat" | xargs)"
               [ -z "$pat" ] && continue
-              printf " --exclude-glob %s" "$pat"
+              # Glob → regex: escape '.', convert '*' to '.*'
+              rx="$pat"
+              rx="${rx//./\\.}"
+              rx="${rx//\*/.*}"
+              rx="^${rx}(/.*)?\$"
+              printf " --exclude %s" "$rx"
             done <<< "$PRESERVE_GLOBS"
             printf " -- %s %s\n" "$LOCAL_DIR" "$FTP_DIR"
 
