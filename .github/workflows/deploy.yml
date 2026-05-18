@@ -55,7 +55,7 @@ on:
         type: string
         default: ''
       exclude:
-        description: 'Glob patterns to exclude from FTP sync (one per line). Useful to preserve runtime files like databases, uploads, logs.'
+        description: 'Filename/dirname patterns to remove before FTP upload (one per line). Patterns match basenames; recursively removed from local-dir.'
         required: false
         type: string
         default: ''
@@ -360,54 +360,64 @@ jobs:
           echo "$IPV4 $FTP_HOST" | sudo tee -a /etc/hosts > /dev/null
           echo "Pinned $FTP_HOST to IPv4 (avoids broken IPv6 EPSV on shared hosting)"
 
-      - name: Build exclude list
-        id: exclude
+      - name: Prune local dir & build exclude list
+        id: prune
         env:
+          LOCAL_DIR:    ${{ steps.localdir.outputs.dir }}
           USER_EXCLUDE: ${{ inputs.exclude }}
         run: |
-          # Patterns are passed to lftp's --exclude-glob, which uses fnmatch
-          # WITHOUT FNM_PATHNAME (so '*' matches '/' too). When a directory
-          # matches an exclude pattern, mirror skips it entirely (no descent).
-          # Patterns are matched against the relative path from local-dir.
+          # Two-level exclusion strategy:
           #
-          # If user passes FTP-Deploy-Action-style patterns (**/*.db, **/dir/**),
-          # we normalize them by stripping leading '**/' and trailing '/**'.
+          # 1) DEFAULTS (.git, node_modules, etc.): physically removed from
+          #    LOCAL_DIR. lftp never sees them; mirror --delete will clean any
+          #    orphan copies on the remote (e.g. .git uploaded by old deploys).
+          #
+          # 2) USER patterns (*.db, *.log, etc.): physically removed from
+          #    LOCAL_DIR AND passed to lftp --exclude-glob. The latter PROTECTS
+          #    matching files on the remote from being deleted by mirror, which
+          #    is what you want for runtime-created data (SQLite DBs, logs, etc).
+
+          DEFAULTS=(
+            ".git" ".github" ".gitignore" ".gitattributes" ".gitkeep"
+            "node_modules"
+            ".DS_Store" "Thumbs.db"
+            ".vscode" ".idea"
+            ".env"
+          )
+
+          # Parse user excludes — normalize FTP-Deploy-Action style globs
+          USER_PATS=()
+          if [ -n "$USER_EXCLUDE" ]; then
+            while IFS= read -r pat; do
+              pat="$(echo "$pat" | xargs)"
+              [ -z "$pat" ] && continue
+              case "$pat" in '#'*) continue ;; esac
+              case "$pat" in '**/'*) pat="${pat#"**/"}" ;; esac
+              case "$pat" in *'/**') pat="${pat%"/**"}" ;; esac
+              USER_PATS+=( "$pat" )
+            done <<< "$USER_EXCLUDE"
+          fi
+
+          ALL=( "${DEFAULTS[@]}" "${USER_PATS[@]}" )
+          echo "Pruning patterns from $LOCAL_DIR:"
+          printf "  - %s\n" "${ALL[@]}"
+
+          for pat in "${ALL[@]}"; do
+            find "$LOCAL_DIR" -mindepth 1 -name "$pat" -prune -exec rm -rf {} + 2>/dev/null || true
+          done
+
+          echo ""
+          echo "Remaining top-level entries in $LOCAL_DIR:"
+          ls -la "$LOCAL_DIR" | head -50
+
+          # Output user patterns for lftp --exclude-glob (protect on remote).
+          # Defaults are NOT in this list — orphan .git etc. should be deletable.
           {
-            echo "list<<__EOF_EXC__"
-            # Version control + CI metadata
-            echo ".git"
-            echo ".gitignore"
-            echo ".gitattributes"
-            echo ".gitkeep"
-            echo ".github"
-            # node_modules: never deploy. PHP vendor/ DOES deploy (composer
-            # install runs in build, vendor/ is needed at runtime by autoloader).
-            echo "node_modules"
-            # OS metadata
-            echo ".DS_Store"
-            echo "Thumbs.db"
-            # Editor/IDE metadata
-            echo ".vscode"
-            echo ".idea"
-            # Env / secrets — never push these to FTP
-            echo ".env"
-            echo ".env.*"
-            # Caller-provided additions (normalize FTP-Deploy-Action-style globs)
-            if [ -n "$USER_EXCLUDE" ]; then
-              while IFS= read -r pat; do
-                pat="$(echo "$pat" | xargs)"
-                [ -z "$pat" ] && continue
-                # Strip '**/' prefix and '/**' suffix for lftp compatibility
-                case "$pat" in
-                  '**/'*) pat="${pat#"**/"}" ;;
-                esac
-                case "$pat" in
-                  *'/**') pat="${pat%"/**"}" ;;
-                esac
-                echo "$pat"
-              done <<< "$USER_EXCLUDE"
+            echo "preserve_globs<<__EOF_PG__"
+            if [ "${#USER_PATS[@]}" -gt 0 ]; then
+              printf '%s\n' "${USER_PATS[@]}"
             fi
-            echo "__EOF_EXC__"
+            echo "__EOF_PG__"
           } >> "$GITHUB_OUTPUT"
 
       - name: Install lftp
@@ -418,13 +428,13 @@ jobs:
 
       - name: Deploy via lftp
         env:
-          FTP_HOST:    ${{ steps.ftp.outputs.server }}
-          FTP_PORT:    ${{ steps.ftp.outputs.port }}
-          FTP_PROTO:   ${{ steps.ftp.outputs.protocol }}
-          FTP_DIR:     ${{ steps.ftp.outputs.server_dir }}
-          LOCAL_DIR:   ${{ steps.localdir.outputs.dir }}
-          CLEAN_SLATE: ${{ inputs.clean_slate }}
-          EXCLUDES:    ${{ steps.exclude.outputs.list }}
+          FTP_HOST:       ${{ steps.ftp.outputs.server }}
+          FTP_PORT:       ${{ steps.ftp.outputs.port }}
+          FTP_PROTO:      ${{ steps.ftp.outputs.protocol }}
+          FTP_DIR:        ${{ steps.ftp.outputs.server_dir }}
+          LOCAL_DIR:      ${{ steps.localdir.outputs.dir }}
+          CLEAN_SLATE:    ${{ inputs.clean_slate }}
+          PRESERVE_GLOBS: ${{ steps.prune.outputs.preserve_globs }}
         run: |
           set -euo pipefail
 
@@ -477,11 +487,14 @@ jobs:
               printf " --delete"
             fi
             printf " --parallel=2"
+            # PRESERVE_GLOBS protect runtime files (DBs, logs, etc.) on remote
+            # from being deleted by mirror. Defaults like .git are intentionally
+            # NOT in this list — we want orphan cleanup to happen.
             while IFS= read -r pat; do
               pat="$(echo "$pat" | xargs)"
               [ -z "$pat" ] && continue
               printf " --exclude-glob %s" "$pat"
-            done <<< "$EXCLUDES"
+            done <<< "$PRESERVE_GLOBS"
             printf " -- %s %s\n" "$LOCAL_DIR" "$FTP_DIR"
 
             echo "bye"
