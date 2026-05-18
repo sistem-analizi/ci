@@ -344,6 +344,42 @@ jobs:
           EOF
 
       # ── 6. Deploy ───────────────────────────────────────────────────────────
+      - name: Build exclude list
+        id: exclude
+        env:
+          USER_EXCLUDE: ${{ inputs.exclude }}
+        run: |
+          # Defaults are ALWAYS applied so callers don't have to remember them.
+          # Caller's `exclude` input adds to this list, never replaces it.
+          {
+            echo "list<<__EOF_EXC__"
+            # Version control + CI metadata
+            echo "**/.git"
+            echo "**/.git/**"
+            echo "**/.gitignore"
+            echo "**/.gitattributes"
+            echo "**/.gitkeep"
+            echo "**/.github"
+            echo "**/.github/**"
+            # node_modules: never deploy. PHP vendor/ DOES deploy (composer
+            # install runs in build, vendor/ is needed at runtime by autoloader).
+            echo "**/node_modules/**"
+            # OS metadata
+            echo "**/.DS_Store"
+            echo "**/Thumbs.db"
+            # Editor/IDE metadata
+            echo "**/.vscode/**"
+            echo "**/.idea/**"
+            # Env / secrets — never push these to FTP
+            echo "**/.env"
+            echo "**/.env.*"
+            # Caller-provided additions
+            if [ -n "$USER_EXCLUDE" ]; then
+              printf '%s\n' "$USER_EXCLUDE"
+            fi
+            echo "__EOF_EXC__"
+          } >> "$GITHUB_OUTPUT"
+
       - name: Deploy to FTP
         uses: SamKirkland/FTP-Deploy-Action@v4.3.5
         with:
@@ -355,4 +391,4 @@ jobs:
           password:   ${{ env.FTP_PASS }}
           local-dir:  ${{ steps.localdir.outputs.dir }}
           dangerous-clean-slate: ${{ inputs.clean_slate }}
-          exclude:    ${{ inputs.exclude }}
+          exclude:    ${{ steps.exclude.outputs.list }}
