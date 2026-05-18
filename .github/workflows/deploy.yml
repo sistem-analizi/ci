@@ -396,6 +396,12 @@ jobs:
             echo "__EOF_EXC__"
           } >> "$GITHUB_OUTPUT"
 
+      - name: Install lftp
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq lftp
+          lftp --version | head -1
+
       - name: Deploy via lftp
         env:
           FTP_HOST:    ${{ steps.ftp.outputs.server }}
