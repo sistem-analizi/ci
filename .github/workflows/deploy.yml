@@ -344,6 +344,22 @@ jobs:
           EOF
 
       # ── 6. Deploy ───────────────────────────────────────────────────────────
+      - name: Force IPv4 DNS for FTP host
+        env:
+          FTP_HOST: ${{ steps.ftp.outputs.server }}
+        run: |
+          # Many shared-hosting FTP servers are dual-stack but their IPv6 PASV
+          # (EPSV) path is broken (ECONNRESET mid-transfer). GitHub runners
+          # prefer IPv6 by default. Force IPv4-only resolution via /etc/hosts.
+          IPV4="$(getent ahostsv4 "$FTP_HOST" 2>/dev/null | awk 'NR==1{print $1}')"
+          if [ -z "$IPV4" ]; then
+            echo "::warning::Could not resolve IPv4 for $FTP_HOST — proceeding with default DNS"
+            exit 0
+          fi
+          printf '::add-mask::%s\n' "$IPV4"
+          echo "$IPV4 $FTP_HOST" | sudo tee -a /etc/hosts > /dev/null
+          echo "Pinned $FTP_HOST to IPv4 (avoids broken IPv6 EPSV on shared hosting)"
+
       - name: Build exclude list
         id: exclude
         env:
