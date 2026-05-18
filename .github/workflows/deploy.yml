@@ -54,6 +54,11 @@ on:
         required: false
         type: string
         default: ''
+      exclude:
+        description: 'Glob patterns to exclude from FTP sync (one per line). Useful to preserve runtime files like databases, uploads, logs.'
+        required: false
+        type: string
+        default: ''
     secrets:
       FTP_URI:
         required: true
@@ -350,3 +355,4 @@ jobs:
           password:   ${{ env.FTP_PASS }}
           local-dir:  ${{ steps.localdir.outputs.dir }}
           dangerous-clean-slate: ${{ inputs.clean_slate }}
+          exclude:    ${{ inputs.exclude }}
