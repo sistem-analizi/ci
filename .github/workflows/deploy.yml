@@ -21,13 +21,18 @@ on:
         required: false
         type: string
         default: ''
+      working_directory:
+        description: 'Project subdirectory (for monorepos). Lockfiles, install, build_command and output_dir are all resolved relative to this. Default: repo root.'
+        required: false
+        type: string
+        default: '.'
       build_command:
-        description: 'Override default build command (node/php only)'
+        description: 'Override default build command (node/php only). Runs inside working_directory.'
         required: false
         type: string
         default: ''
       output_dir:
-        description: 'Override local output directory (e.g. dist, out, .output/public)'
+        description: 'Override local output directory (e.g. dist, out, .output/public). Relative to working_directory.'
         required: false
         type: string
         default: ''
@@ -135,18 +140,46 @@ jobs:
             exit 1
           fi
 
+      # ── 2b. Validate working_directory ──────────────────────────────────────
+      - name: Validate working_directory
+        env:
+          WORKDIR: ${{ inputs.working_directory }}
+        run: |
+          if [ -z "$WORKDIR" ]; then
+            echo "::error::working_directory cannot be empty (use '.' for repo root)"
+            exit 1
+          fi
+          case "$WORKDIR" in
+            /*|*..*)
+              echo "::error::working_directory must be a relative path without '..': $WORKDIR"
+              exit 1 ;;
+          esac
+          if [ ! -d "$WORKDIR" ]; then
+            echo "::error::working_directory not found: $WORKDIR"
+            exit 1
+          fi
+          echo "Working directory: $WORKDIR"
+
       # ── 3a. Node build ──────────────────────────────────────────────────────
+      # Lockfiles aranır ve install çalışır working_directory içinde. Monorepo
+      # repolarında frontend/ veya packages/web/ gibi alt dizinleri destekler.
       - name: Detect package manager
         if: inputs.build_type == 'node'
         id: pm
+        working-directory: ${{ inputs.working_directory }}
         run: |
           if [ -f pnpm-lock.yaml ]; then
-            echo "pm=pnpm" >> "$GITHUB_OUTPUT"
+            mgr=pnpm; lock=pnpm-lock.yaml
           elif [ -f yarn.lock ]; then
-            echo "pm=yarn" >> "$GITHUB_OUTPUT"
+            mgr=yarn; lock=yarn.lock
+          elif [ -f package-lock.json ]; then
+            mgr=npm;  lock=package-lock.json
           else
-            echo "pm=npm" >> "$GITHUB_OUTPUT"
+            mgr=npm;  lock=
           fi
+          echo "pm=$mgr"            >> "$GITHUB_OUTPUT"
+          echo "lockfile=$lock"     >> "$GITHUB_OUTPUT"
+          echo "Detected package manager: $mgr (lockfile: ${lock:-<none>})"
 
       - name: Setup pnpm
         if: inputs.build_type == 'node' && steps.pm.outputs.pm == 'pnpm'
@@ -159,7 +192,10 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: ${{ inputs.node_version }}
-          cache: ${{ steps.pm.outputs.pm }}
+          # Cache yalnızca gerçek bir lockfile varsa devreye girer; yoksa
+          # setup-node "lock file not found" hatası vermesin diye boş bırak.
+          cache: ${{ steps.pm.outputs.lockfile != '' && steps.pm.outputs.pm || '' }}
+          cache-dependency-path: ${{ steps.pm.outputs.lockfile != '' && format('{0}/{1}', inputs.working_directory, steps.pm.outputs.lockfile) || '' }}
 
       - name: Apply caller build env (non-secret)
         if: (inputs.build_type == 'node' || inputs.build_type == 'php') && inputs.build_env != ''
@@ -240,6 +276,7 @@ jobs:
 
       - name: Install & build (node)
         if: inputs.build_type == 'node'
+        working-directory: ${{ inputs.working_directory }}
         env:
           CI: 'false'
           PUBLIC_URL:        /${{ steps.path.outputs.rel }}/
@@ -251,6 +288,7 @@ jobs:
         run: |
           echo "Package manager: $PM"
           echo "PUBLIC_URL: $PUBLIC_URL"
+          echo "Working dir: $(pwd)"
 
           # Install
           case "$PM" in
@@ -285,9 +323,11 @@ jobs:
 
       - name: Composer install (php)
         if: inputs.build_type == 'php'
+        working-directory: ${{ inputs.working_directory }}
         env:
           CUSTOM_CMD: ${{ inputs.build_command }}
         run: |
+          echo "Working dir: $(pwd)"
           if [ -f composer.json ]; then
             composer install --no-dev --optimize-autoloader
           fi
@@ -298,11 +338,14 @@ jobs:
       # ── 3c. Static: nothing to build ────────────────────────────────────────
 
       # ── 4. Resolve local output directory ───────────────────────────────────
+      # output_dir caller'dan geliyorsa working_directory'ye göre çözülür.
+      # Default'lar (./build/, ./) da working_directory altına prefix'lenir.
       - name: Resolve local dir
         id: localdir
         env:
           OVERRIDE:   ${{ inputs.output_dir }}
           BUILD_TYPE: ${{ inputs.build_type }}
+          WORKDIR:    ${{ inputs.working_directory }}
         run: |
           if [ -n "$OVERRIDE" ]; then
             dir="${OVERRIDE%/}/"
@@ -311,6 +354,14 @@ jobs:
               node)   dir="./build/" ;;
               php)    dir="./" ;;
               static) dir="./" ;;
+            esac
+          fi
+          # working_directory != '.' ise relative path'i prefix'le.
+          # Absolute path'lere (örn. /tmp/...) dokunma.
+          if [ "$WORKDIR" != "." ] && [ -n "$WORKDIR" ]; then
+            case "$dir" in
+              /*) ;;
+              *)  dir="${WORKDIR%/}/${dir#./}" ;;
             esac
           fi
           if [ ! -d "$dir" ]; then
